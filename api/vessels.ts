@@ -71,8 +71,8 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
   let metaMap = new Map<number, { name: string; shipType: number; dest: string; callSign: string }>();
   try {
     const metaData = await fetchGzip("https://meri.digitraffic.fi/api/ais/v1/vessels", 12000);
-    const vessels: any[] = Array.isArray(metaData) ? metaData : [];
-    for (const v of vessels) {
+    const metaVessels: any[] = Array.isArray(metaData) ? metaData : [];
+    for (const v of metaVessels) {
       metaMap.set(v.mmsi, {
         name: v.name ?? "",
         shipType: v.shipType ?? 0,

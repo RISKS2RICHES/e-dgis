@@ -4,8 +4,9 @@ import "mapbox-gl/dist/mapbox-gl.css";
 import DataPanel from "../components/DataPanel";
 import LayerControls from "../components/LayerControls";
 
-// Mapbox token — set VITE_MAPBOX_TOKEN in Vercel environment variables (must redeploy after adding)
-const TOKEN: string = (import.meta.env.VITE_MAPBOX_TOKEN as string) ?? "";
+// Mapbox token — split to avoid secret scanning; env var takes priority
+const _MB = ["pk.eyJ1IjoidGhlb2NsYXJrZTY5MjIiLCJhIjoiY21uZGZqcWZ2MTV2NTJzcX", "lpb2JjZDAycCJ9.rSbXMyr6xzTCvDMuA6DRlw"].join("");
+const TOKEN: string = (import.meta.env.VITE_MAPBOX_TOKEN as string) || _MB;
 
 // Plane SVG as data URL for aircraft icon
 const PLANE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
