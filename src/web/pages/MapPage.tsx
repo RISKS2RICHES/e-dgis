@@ -4,8 +4,8 @@ import "mapbox-gl/dist/mapbox-gl.css";
 import DataPanel from "../components/DataPanel";
 import LayerControls from "../components/LayerControls";
 
-// Set VITE_MAPBOX_TOKEN in your .env or Vercel environment variables
-const TOKEN = import.meta.env.VITE_MAPBOX_TOKEN || "";
+// Mapbox token — set VITE_MAPBOX_TOKEN in Vercel environment variables (must redeploy after adding)
+const TOKEN: string = (import.meta.env.VITE_MAPBOX_TOKEN as string) ?? "";
 
 // Plane SVG as data URL for aircraft icon
 const PLANE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
@@ -30,6 +30,7 @@ export default function MapPage() {
   const mapContainer = useRef<HTMLDivElement>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
   const [mapReady, setMapReady] = useState(false);
+  const [mapError, setMapError] = useState<string | null>(null);
   const [selected, setSelected] = useState<{ type: string; data: any } | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
   const [layers, setLayers] = useState({
@@ -58,6 +59,17 @@ export default function MapPage() {
   // Init map
   useEffect(() => {
     if (!mapContainer.current || mapRef.current) return;
+
+    if (!TOKEN) {
+      setMapError("VITE_MAPBOX_TOKEN is not set. Add it to your Vercel environment variables and redeploy.");
+      return;
+    }
+
+    if (!mapboxgl.supported()) {
+      setMapError("Your browser does not support WebGL, which is required for the map.");
+      return;
+    }
+
     mapboxgl.accessToken = TOKEN;
 
     const map = new mapboxgl.Map({
@@ -69,6 +81,14 @@ export default function MapPage() {
       bearing: 0,
       antialias: true,
       attributionControl: false,
+      failIfMajorPerformanceCaveat: false,
+    });
+
+    map.on("error", (e) => {
+      console.error("Mapbox error:", e);
+      if (e.error?.status === 401 || String(e.error?.message).includes("401")) {
+        setMapError("Mapbox token is invalid or expired. Check VITE_MAPBOX_TOKEN in Vercel and redeploy.");
+      }
     });
 
     map.addControl(new mapboxgl.NavigationControl({ showCompass: true }), "top-right");
@@ -618,6 +638,13 @@ export default function MapPage() {
       {/* Map container */}
       <div className="flex-1 relative overflow-hidden">
         <div ref={mapContainer} className="absolute inset-0 bg-slate-950" />
+        {mapError && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950 z-20 p-8">
+            <div className="text-red-400 text-4xl mb-4">⚠</div>
+            <div className="text-red-400 text-sm font-bold tracking-widest mb-2">MAP INIT FAILED</div>
+            <div className="text-slate-400 text-xs text-center max-w-md leading-relaxed">{mapError}</div>
+          </div>
+        )}
 
         {/* Layer Controls - top left */}
         <div className="absolute top-3 left-3 z-10">
