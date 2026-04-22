@@ -1,98 +1,152 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
+// ── Digitraffic (Finnish Transport Infrastructure Agency) ──────────────────
+// Open data, no key needed, works from any IP including Vercel datacenters
+// Covers Baltic Sea + North Sea + global vessels reporting to Finnish AIS network
+// Updated every ~30s, 18000+ vessels
+
+interface Vessel {
+  mmsi: string;
+  name: string;
+  type: number;
+  lat: number;
+  lon: number;
+  speed: number;
+  heading: number;
+  course: number;
+  dest: string;
+  flag: string;
+  source: string;
+}
+
+async function fetchGzip(url: string, timeoutMs = 10000): Promise<any> {
+  const r = await fetch(url, {
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: {
+      "Accept-Encoding": "gzip",
+      "User-Agent": "E-DGIS/1.0",
+      "Accept": "application/json",
+    },
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
 export default async function handler(_req: VercelRequest, res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   if (_req.method === "OPTIONS") { res.status(200).end(); return; }
 
-  const vessels: any[] = [];
-  const seen = new Set<string>();
+  const vessels: Vessel[] = [];
+  const errors: string[] = [];
+  const now = Date.now();
+  const STALE_MS = 30 * 60 * 1000; // only show vessels seen in last 30 min
 
-  const addVessel = (v: any) => {
-    const key = String(v.mmsi || v.lat + "," + v.lon);
-    if (seen.has(key)) return;
-    seen.add(key);
-    vessels.push(v);
-  };
-
-  await Promise.allSettled([
-    // AISHub REST API
-    fetch("https://api.aishub.net/ais/vessels?format=json&limit=500", {
-      signal: AbortSignal.timeout(6000),
-      headers: { "User-Agent": "E-DGIS/1.0" },
-    }).then(async (r) => {
-      if (!r.ok) return;
-      const d: any = await r.json();
-      const arr = Array.isArray(d) ? d : d.data || d.vessels || [];
-      arr.forEach((v: any) => {
-        const lat = parseFloat(v.LATITUDE || v.lat || 0);
-        const lon = parseFloat(v.LONGITUDE || v.lon || 0);
-        if (!lat || !lon || (Math.abs(lat) < 0.001 && Math.abs(lon) < 0.001)) return;
-        addVessel({
-          mmsi: v.MMSI || v.mmsi || "",
-          name: v.SHIPNAME || v.name || "UNKNOWN",
-          type: v.SHIPTYPE || 0,
-          lat, lon,
-          speed: parseFloat(v.SPEED || v.sog || 0) / 10,
-          heading: parseFloat(v.HEADING || v.hdg || 0),
-          course: parseFloat(v.COURSE || v.cog || 0),
-          dest: v.DESTINATION || "",
-          flag: v.FLAG || "",
+  // ── Source 1: Digitraffic — locations (GeoJSON FeatureCollection) ─────────
+  // This is the PRIMARY source — 18k+ vessels, truly open, no key
+  let locationMap = new Map<number, { lon: number; lat: number; sog: number; cog: number; heading: number; ts: number }>();
+  try {
+    const locData = await fetchGzip("https://meri.digitraffic.fi/api/ais/v1/locations", 12000);
+    const features: any[] = locData.features || [];
+    for (const f of features) {
+      const props = f.properties;
+      const [lon, lat] = f.geometry.coordinates;
+      const ts = props.timestampExternal ?? 0;
+      // Only keep vessels seen in last 30 min
+      if (now - ts < STALE_MS) {
+        locationMap.set(props.mmsi, {
+          lon, lat,
+          sog: props.sog ?? 0,
+          cog: props.cog ?? 0,
+          heading: props.heading ?? 0,
+          ts,
         });
-      });
-    }).catch(() => {}),
+      }
+    }
+  } catch (e: any) {
+    errors.push(`digitraffic-locations: ${e.message}`);
+  }
 
-    // VesselFinder public map API
-    fetch("https://www.vesselfinder.com/api/pub/vesselsonmap/json?bbox=-180,-85,180,85", {
-      signal: AbortSignal.timeout(6000),
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; E-DGIS/1.0)" },
-    }).then(async (r) => {
-      if (!r.ok) return;
-      const d: any = await r.json();
-      (Array.isArray(d) ? d : []).forEach((v: any) => {
-        const lat = parseFloat(v[0] || 0);
-        const lon = parseFloat(v[1] || 0);
-        if (!lat || !lon) return;
-        addVessel({
-          mmsi: v[2] || "",
-          name: v[3] || "UNKNOWN",
-          type: 0,
-          lat, lon,
-          speed: parseFloat(v[7] || 0) / 10,
-          heading: parseFloat(v[5] || 0),
-          course: parseFloat(v[6] || 0),
-          dest: "",
-          flag: "",
+  // ── Source 2: Digitraffic — vessel metadata (name, type, destination) ─────
+  let metaMap = new Map<number, { name: string; shipType: number; dest: string; callSign: string }>();
+  try {
+    const metaData = await fetchGzip("https://meri.digitraffic.fi/api/ais/v1/vessels", 12000);
+    const vessels: any[] = Array.isArray(metaData) ? metaData : [];
+    for (const v of vessels) {
+      metaMap.set(v.mmsi, {
+        name: v.name ?? "",
+        shipType: v.shipType ?? 0,
+        dest: v.destination ?? "",
+        callSign: v.callSign ?? "",
+      });
+    }
+  } catch (e: any) {
+    errors.push(`digitraffic-meta: ${e.message}`);
+  }
+
+  // ── Merge location + metadata ─────────────────────────────────────────────
+  for (const [mmsi, loc] of locationMap) {
+    const meta = metaMap.get(mmsi);
+    if (!loc.lat || !loc.lon || isNaN(loc.lat) || isNaN(loc.lon)) continue;
+    vessels.push({
+      mmsi: String(mmsi),
+      name: meta?.name || `MMSI ${mmsi}`,
+      type: meta?.shipType ?? 0,
+      lat: +loc.lat.toFixed(5),
+      lon: +loc.lon.toFixed(5),
+      speed: +(loc.sog / 10).toFixed(1),
+      heading: loc.heading,
+      course: +loc.cog.toFixed(1),
+      dest: meta?.dest ?? "",
+      flag: "",
+      source: "DIGITRAFFIC",
+    });
+  }
+
+  // ── Source 3: Try VesselFinder public API (works from some DCs) ───────────
+  if (vessels.length < 100) {
+    try {
+      const r = await fetch(
+        "https://www.vesselfinder.com/api/pub/vesselsonmap/json?bbox=-180,-85,180,85",
+        {
+          signal: AbortSignal.timeout(8000),
+          headers: { "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" },
+        }
+      );
+      if (r.ok) {
+        const d: any = await r.json();
+        const seen = new Set(vessels.map(v => v.mmsi));
+        (Array.isArray(d) ? d : []).forEach((v: any) => {
+          const lat = parseFloat(v[0] ?? 0);
+          const lon = parseFloat(v[1] ?? 0);
+          if (!lat || !lon) return;
+          const mmsi = String(v[2] ?? "");
+          if (seen.has(mmsi)) return;
+          seen.add(mmsi);
+          vessels.push({
+            mmsi, name: v[3] || "UNKNOWN", type: 0,
+            lat: +lat.toFixed(5), lon: +lon.toFixed(5),
+            speed: +(parseFloat(v[7] ?? 0) / 10).toFixed(1),
+            heading: parseFloat(v[5] ?? 0),
+            course: parseFloat(v[6] ?? 0),
+            dest: "", flag: "", source: "VESSELFINDER",
+          });
         });
-      });
-    }).catch(() => {}),
+      }
+    } catch (e: any) {
+      errors.push(`vesselfinder: ${e.message}`);
+    }
+  }
 
-    // Marine Traffic public tile API
-    fetch("https://www.marinetraffic.com/getData/get_data_json_4/z:2/X:0/Y:0/station:0", {
-      signal: AbortSignal.timeout(6000),
-      headers: { "User-Agent": "Mozilla/5.0", Referer: "https://www.marinetraffic.com/" },
-    }).then(async (r) => {
-      if (!r.ok) return;
-      const d: any = await r.json();
-      const rows = d?.data?.rows || d?.rows || [];
-      rows.forEach((v: any) => {
-        const lat = parseFloat(v.LAT || v.lat || 0);
-        const lon = parseFloat(v.LON || v.lon || 0);
-        if (!lat || !lon) return;
-        addVessel({
-          mmsi: v.MMSI || "",
-          name: v.SHIPNAME || v.name || "UNKNOWN",
-          type: parseInt(v.SHIPTYPE || 0),
-          lat, lon,
-          speed: parseFloat(v.SPEED || 0) / 10,
-          heading: parseFloat(v.HEADING || 0),
-          course: parseFloat(v.COURSE || 0),
-          dest: v.DESTINATION || "",
-          flag: v.FLAG || "",
-        });
-      });
-    }).catch(() => {}),
-  ]);
-
-  res.json({ status: "ok", count: vessels.length, vessels: vessels.slice(0, 2000), ts: Date.now() });
+  res.setHeader("Cache-Control", "public, s-maxage=30, stale-while-revalidate=60");
+  res.json({
+    status: "ok",
+    count: vessels.length,
+    vessels: vessels.slice(0, 3000),
+    errors: errors.length ? errors : undefined,
+    ts: Date.now(),
+    source: vessels.length > 0
+      ? (vessels[0].source === "DIGITRAFFIC" ? "DIGITRAFFIC_LIVE" : "VESSELFINDER")
+      : "NONE",
+  });
 }
